@@ -2,12 +2,27 @@
 
 namespace Clue\React\Soap;
 
+use Clue\React\Soap\Protocol\BrowserTransport;
+use Clue\React\Soap\Protocol\BrowserWsdlLoader;
 use Clue\React\Soap\Protocol\ClientDecoder;
 use Clue\React\Soap\Protocol\ClientEncoder;
 use Psr\Http\Message\ResponseInterface;
 use React\Http\Browser;
 use React\Promise\Deferred;
 use React\Promise\PromiseInterface;
+use Soap\Engine\Engine;
+use Soap\Engine\LazyEngine;
+use Soap\Engine\Metadata\Collection\MethodCollection;
+use Soap\Engine\Metadata\Collection\TypeCollection;
+use Soap\Engine\SimpleEngine;
+use Soap\ExtSoapEngine\AbusedClient;
+use Soap\ExtSoapEngine\ExtSoapDriver;
+use Soap\ExtSoapEngine\ExtSoapOptions;
+use Soap\ExtSoapEngine\Transport\TraceableTransport;
+use Soap\ExtSoapEngine\Wsdl\InMemoryWsdlProvider;
+use Soap\Wsdl\Loader\FlatteningLoader;
+use Soap\Wsdl\Loader\WsdlLoader;
+use function React\Async\async;
 
 /**
  * The `Client` class is responsible for communication with the remote SOAP
@@ -142,23 +157,18 @@ use React\Promise\PromiseInterface;
  */
 class Client
 {
-    /** @var Browser */
-    private $browser;
-
-    private $encoder;
-    private $decoder;
+    private Browser $browser;
+    private Engine $engine;
 
     /**
      * Instantiate a new SOAP client for the given WSDL contents.
      *
      * @param ?Browser $browser
-     * @param ?string  $wsdlContents
-     * @param ?array   $options
+     * @param ?string $wsdlContents
+     * @param ?array $options
      */
     public function __construct(?Browser $browser, ?string $wsdlContents, array $options = array())
     {
-        $wsdl = $wsdlContents !== null ? 'data://text/plain;base64,' . base64_encode($wsdlContents) : null;
-
         $this->browser = $browser ?? new Browser();
 
         // Accept HTTP responses with error status codes as valid responses.
@@ -168,8 +178,31 @@ class Client
         $this->browser = $this->browser->withRejectErrorResponse(false);
         $this->browser = $this->browser->withFollowRedirects(0);
 
-        $this->encoder = new ClientEncoder($wsdl, $options);
-        $this->decoder = new ClientDecoder($wsdl, $options);
+        $this->engine = new LazyEngine(fn() => new SimpleEngine(
+            ExtSoapDriver::createFromClient(
+                // You can make this private as well, giving you access to the regular SoapClient functions.
+                // Like __setSoapHeaders, __setLocation, ...
+                $client = AbusedClient::createFromOptions(
+                    ExtSoapOptions::defaults($wsdlContents)
+                        ->withWsdlProvider(new InMemoryWsdlProvider())
+                )
+            ),
+            new TraceableTransport(
+                $client,
+                new BrowserTransport($browser)
+            )
+        ));
+    }
+
+    public static function forWsdl(Browser $browser, string $wsdlUri, array $options = [])
+    {
+        $loader = new FlatteningLoader(new BrowserWsdlLoader($browser));
+
+        return new self(
+            $browser,
+            $loader($wsdlUri),
+            $options
+        );
     }
 
     /**
@@ -187,33 +220,13 @@ class Client
      * $promise = $proxy->ping('hello', 42);
      * ```
      *
-     * @param string  $name
+     * @param string $name
      * @param mixed[] $args
      * @return PromiseInterface Returns a Promise<mixed, Exception>
      */
     public function soapCall(string $name, array $args): PromiseInterface
     {
-        try {
-            $request = $this->encoder->encode($name, $args);
-        } catch (\Exception $e) {
-            $deferred = new Deferred();
-            $deferred->reject($e);
-            return $deferred->promise();
-        }
-
-        $decoder = $this->decoder;
-
-        return $this->browser->request(
-            $request->getMethod(),
-            (string) $request->getUri(),
-            $request->getHeaders(),
-            (string) $request->getBody()
-        )->then(
-            function (ResponseInterface $response) use ($decoder, $name) {
-                // HTTP response received => decode results for this function call
-                return $decoder->decode($name, (string)$response->getBody());
-            }
-        );
+        return async(fn() => $this->engine->request($name, $args))();
     }
 
     /**
@@ -222,12 +235,10 @@ class Client
      * It returns the equivalent of PHP's
      * [`SoapClient::__getFunctions()`](https://www.php.net/manual/en/soapclient.getfunctions.php).
      * In non-WSDL mode, this method returns `null`.
-     *
-     * @return string[]|null
      */
-    public function getFunctions(): ?array
+    public function getFunctions(): MethodCollection
     {
-        return $this->encoder->__getFunctions();
+        return $this->engine->getMetadata()->getMethods();
     }
 
     /**
@@ -236,105 +247,9 @@ class Client
      * It returns the equivalent of PHP's
      * [`SoapClient::__getTypes()`](https://www.php.net/manual/en/soapclient.gettypes.php).
      * In non-WSDL mode, this method returns `null`.
-     *
-     * @return string[]|null
      */
-    public function getTypes(): ?array
+    public function getTypes(): TypeCollection
     {
-        return $this->encoder->__getTypes();
-    }
-
-    /**
-     * Returns the location (URI) of the given webservice `$function`.
-     *
-     * Note that this is not to be confused with the WSDL file location.
-     * A WSDL file can contain any number of function definitions.
-     * It's very common that all of these functions use the same location definition.
-     * However, technically each function can potentially use a different location.
-     *
-     * The `$function` parameter should be a string with the the SOAP function name.
-     * See also [`getFunctions()`](#getfunctions) for a list of all available functions.
-     *
-     * ```php
-     * assert('http://example.com/soap/service' === $client->getLocation('echo'));
-     * ```
-     *
-     * For easier access, this function also accepts a numeric function index.
-     * It then uses [`getFunctions()`](#getfunctions) internally to get the function
-     * name for the given index.
-     * This is particularly useful for the very common case where all functions use the
-     * same location and accessing the first location is sufficient.
-     *
-     * ```php
-     * assert('http://example.com/soap/service' === $client->getLocation(0));
-     * ```
-     *
-     * When the `location` option has been set in the `Client` constructor
-     * (such as when in non-WSDL mode) or via the `withLocation()` method, this
-     * method returns the value of the given location.
-     *
-     * Passing a `$function` not defined in the WSDL file will throw a `SoapFault`.
-     *
-     * @param string|int $function
-     * @return string
-     * @throws \SoapFault if given function does not exist
-     * @see self::getFunctions()
-     */
-    public function getLocation($function): string
-    {
-        if (is_int($function)) {
-            $functions = $this->getFunctions();
-            if (isset($functions[$function]) && preg_match('/^\w+ (\w+)\(/', $functions[$function], $match)) {
-                $function = $match[1];
-            }
-        }
-
-        // encode request for given $function
-        return (string)$this->encoder->encode($function, array())->getUri();
-    }
-
-    /**
-     * Returns a new `Client` with the updated location (URI) for all functions.
-     *
-     * Note that this is not to be confused with the WSDL file location.
-     * A WSDL file can contain any number of function definitions.
-     * It's very common that all of these functions use the same location definition.
-     * However, technically each function can potentially use a different location.
-     *
-     * ```php
-     * $client = $client->withLocation('http://example.com/soap');
-     *
-     * assert('http://example.com/soap' === $client->getLocation('echo'));
-     * ```
-     *
-     * As an alternative to this method, you can also set the `location` option
-     * in the `Client` constructor (such as when in non-WSDL mode).
-     *
-     * @param string $location
-     * @return self
-     * @see self::getLocation()
-     */
-    public function withLocation(string $location): self
-    {
-        $client = clone $this;
-        $client->encoder = clone $this->encoder;
-        $client->encoder->__setLocation($location);
-
-        return $client;
-    }
-    
-    /**
-     * Returns a new `Client` with the given headers for all functions.
-     *
-     * @param array $headers
-     * @return self
-     */
-    public function withHeaders(array $headers): self
-    {
-        $client = clone $this;
-        $client->encoder = clone $this->encoder;
-        $client->encoder->__setSoapHeaders($headers);
-
-        return $client;
+        return $this->engine->getMetadata()->getTypes();
     }
 }
