@@ -2,13 +2,10 @@
 
 namespace Clue\React\Soap;
 
-use Clue\React\Soap\Protocol\BrowserTransport;
-use Clue\React\Soap\Protocol\BrowserWsdlLoader;
-use Clue\React\Soap\Protocol\ClientDecoder;
-use Clue\React\Soap\Protocol\ClientEncoder;
-use Psr\Http\Message\ResponseInterface;
+use Clue\React\Soap\Protocol\Psr18Browser;
+use Http\Client\Common\Plugin;
+use Http\Client\Common\PluginClient;
 use React\Http\Browser;
-use React\Promise\Deferred;
 use React\Promise\PromiseInterface;
 use Soap\Engine\Engine;
 use Soap\Engine\LazyEngine;
@@ -19,9 +16,8 @@ use Soap\ExtSoapEngine\AbusedClient;
 use Soap\ExtSoapEngine\ExtSoapDriver;
 use Soap\ExtSoapEngine\ExtSoapOptions;
 use Soap\ExtSoapEngine\Transport\TraceableTransport;
-use Soap\ExtSoapEngine\Wsdl\InMemoryWsdlProvider;
+use Soap\Psr18Transport\Psr18Transport;
 use Soap\Wsdl\Loader\FlatteningLoader;
-use Soap\Wsdl\Loader\WsdlLoader;
 use function React\Async\async;
 
 /**
@@ -157,20 +153,16 @@ use function React\Async\async;
  */
 class Client
 {
-    private Browser $browser;
     private Engine $engine;
 
     /**
      * Instantiate a new SOAP client for the given WSDL contents.
-     *
-     * @param ?Browser $browser
-     * @param ?string $wsdlContents
-     * @param ?array $options
      */
-    public function __construct(?Browser $browser, ?string $wsdlContents, array $options = array())
-    {
-        $this->browser = $browser ?? new Browser();
-
+    public function __construct(
+        private Browser $browser,
+        ExtSoapOptions $options,
+        Plugin ... $plugins
+    ){
         // Accept HTTP responses with error status codes as valid responses.
         // This is done in order to process these error responses through the normal SOAP decoder.
         // Additionally, we explicitly limit number of redirects to zero because following redirects makes little sense
@@ -182,27 +174,18 @@ class Client
             ExtSoapDriver::createFromClient(
                 // You can make this private as well, giving you access to the regular SoapClient functions.
                 // Like __setSoapHeaders, __setLocation, ...
-                $client = AbusedClient::createFromOptions(
-                    ExtSoapOptions::defaults($wsdlContents)
-                        ->withWsdlProvider(new InMemoryWsdlProvider())
-                )
+                $client = AbusedClient::createFromOptions($options)
             ),
             new TraceableTransport(
                 $client,
-                new BrowserTransport($browser)
+                Psr18Transport::createForClient(
+                    new PluginClient(
+                        new Psr18Browser($browser),
+                        $plugins
+                    )
+                )
             )
         ));
-    }
-
-    public static function forWsdl(Browser $browser, string $wsdlUri, array $options = [])
-    {
-        $loader = new FlatteningLoader(new BrowserWsdlLoader($browser));
-
-        return new self(
-            $browser,
-            $loader($wsdlUri),
-            $options
-        );
     }
 
     /**
